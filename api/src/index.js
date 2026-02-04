@@ -107,7 +107,6 @@ async function assertRecipeOwnership(recipeId, userId) {
 }
 
 // Helper to check inventory item ownership
-
 async function assertInventoryOwnership(itemId, userId) {
   const [rows] = await pool.query(
     "SELECT id FROM inventory_items WHERE id = ? AND user_id = ? LIMIT 1",
@@ -116,6 +115,32 @@ async function assertInventoryOwnership(itemId, userId) {
   return rows.length > 0;
 }
 
+// Helper to parse and validate ID params
+function parseId(param) {
+  const n = Number(param);
+  if (!Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+// Helper to pick pagination params
+function pickPagination(req, defaultPage = 1, defaultPageSize = 20, maxPageSize = 100) {
+  const page = Math.max(1, parseInt(req.query.page || defaultPage, 10));
+  const pageSize = Math.min(
+    maxPageSize,
+    Math.max(1, parseInt(req.query.pageSize || defaultPageSize, 10))
+  );
+  const offset = (page - 1) * pageSize;
+  return { page, pageSize, offset };
+}
+
+// Helper to ensure shopping list ownership
+async function ensureShoppingListOwned(listId, userId) {
+  const [rows] = await pool.query(
+    `SELECT id FROM shopping_lists WHERE id = ? AND user_id = ?`,
+    [listId, userId]
+  );
+  return rows.length > 0;
+}
 
 
 /**
@@ -2369,7 +2394,901 @@ app.get("/inventory/expiring", authRequired, async (req, res) => {
   }
 });
 
+// ----------------------------------------------
+// SHOPPING LIST MANAGEMENT
+// ---------------------------------------------- 
 
+// GET /shopping-lists
+/**
+ * @openapi
+ * /shopping-lists:
+ *   get:
+ *     tags: [Shopping Lists]
+ *     summary: Seznam nakupovalnih listkov (pagination + filter)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: search
+ *         schema: { type: string }
+ *         description: Išče po shopping_lists.name (LIKE %search%)
+ *       - in: query
+ *         name: status
+ *         schema: { type: string }
+ *         description: Npr. active/archived/done (dogovor)
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, minimum: 1, default: 1 }
+ *       - in: query
+ *         name: pageSize
+ *         schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+ *     responses:
+ *       200:
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data: { $ref: '#/components/schemas/ShoppingListsPage' }
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+app.get("/shopping-lists", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { page, pageSize, offset } = pickPagination(req, 1, 20, 100);
+
+    const search = (req.query.search || "").trim();
+    const status = (req.query.status || "").trim();
+
+    const where = ["user_id = ?"];
+    const params = [userId];
+
+    if (status) {
+      where.push("status = ?");
+      params.push(status);
+    }
+    if (search) {
+      where.push("name LIKE ?");
+      params.push(`%${search}%`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM shopping_lists ${whereSql}`,
+      params
+    );
+    const total = countRows[0]?.total ?? 0;
+
+    const [rows] = await pool.query(
+      `
+      SELECT id, user_id, name, status, created_at, updated_at
+      FROM shopping_lists
+      ${whereSql}
+      ORDER BY updated_at DESC, id DESC
+      LIMIT ? OFFSET ?
+      `,
+      [...params, pageSize, offset]
+    );
+
+    res.json({ data: { items: rows, page, pageSize, total } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to list shopping lists" } });
+  }
+});
+
+
+
+// POST /shopping-lists
+/**
+ * @openapi
+ * /shopping-lists:
+ *   post:
+ *     tags: [Shopping Lists]
+ *     summary: Ustvari nov nakupovalni listek
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name]
+ *             properties:
+ *               name: { type: string, example: "Mercator - sobota" }
+ *               status: { type: string, example: "active", description: "Optional, default active" }
+ *     responses:
+ *       201:
+ *         description: Created
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: integer, format: int64, example: 12 }
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       500:
+ *         description: Server error
+ */
+app.post("/shopping-lists", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const name = (req.body?.name || "").trim();
+    const status = (req.body?.status || "active").trim();
+
+    if (!name) {
+      return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "name is required" } });
+    }
+    if (status.length > 20) {
+      return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "status is too long" } });
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO shopping_lists (user_id, name, status, created_at, updated_at)
+       VALUES (?, ?, ?, NOW(), NOW())`,
+      [userId, name, status]
+    );
+
+    res.status(201).json({ data: { id: result.insertId } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to create shopping list" } });
+  }
+});
+
+
+// GET /shopping-lists/:id
+/**
+ * @openapi
+ * /shopping-lists/{id}:
+ *   get:
+ *     tags: [Shopping Lists]
+ *     summary: Vrne en nakupovalni listek (metadata)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     responses:
+ *       200:
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data: { $ref: '#/components/schemas/ShoppingList' }
+ *       400:
+ *         description: Invalid id
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Not found (ne obstaja ali ni tvoj)
+ *       500:
+ *         description: Server error
+ */
+app.get("/shopping-lists/:id", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid id" } });
+
+    const [rows] = await pool.query(
+      `SELECT id, user_id, name, status, created_at, updated_at
+       FROM shopping_lists
+       WHERE id = ? AND user_id = ?`,
+      [id, userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+    }
+
+    res.json({ data: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to get shopping list" } });
+  }
+});
+
+
+// PATCH /shopping-lists/:id
+/**
+ * @openapi
+ * /shopping-lists/{id}:
+ *   patch:
+ *     tags: [Shopping Lists]
+ *     summary: Posodobi listek (name/status)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name: { type: string, example: "Mercator - nedelja" }
+ *               status: { type: string, example: "archived" }
+ *           description: "Pošlji samo polja, ki jih spreminjaš."
+ *     responses:
+ *       200:
+ *         description: Updated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     updated: { type: boolean, example: true }
+ *       400:
+ *         description: Validation error / no fields
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Not found
+ *       500:
+ *         description: Server error
+ */
+app.patch("/shopping-lists/:id", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid id" } });
+
+    const fields = [];
+    const params = [];
+
+    if (req.body?.name !== undefined) {
+      const name = (req.body.name || "").trim();
+      if (!name) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "name cannot be empty" } });
+      fields.push("name = ?");
+      params.push(name);
+    }
+
+    if (req.body?.status !== undefined) {
+      const status = (req.body.status || "").trim();
+      if (!status) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "status cannot be empty" } });
+      if (status.length > 20) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "status is too long" } });
+      fields.push("status = ?");
+      params.push(status);
+    }
+
+    if (!fields.length) {
+      return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "No fields to update" } });
+    }
+
+    fields.push("updated_at = NOW()");
+
+    const [result] = await pool.query(
+      `UPDATE shopping_lists SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`,
+      [...params, id, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+    }
+
+    res.json({ data: { updated: true } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to update shopping list" } });
+  }
+});
+
+
+// DELETE /shopping-lists/:id
+/**
+ * @openapi
+ * /shopping-lists/{id}:
+ *   delete:
+ *     tags: [Shopping Lists]
+ *     summary: Izbriše listek (cascade izbriše items)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     responses:
+ *       204:
+ *         description: Deleted
+ *       400:
+ *         description: Invalid id
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Not found
+ *       500:
+ *         description: Server error
+ */
+app.delete("/shopping-lists/:id", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid id" } });
+
+    const [result] = await pool.query(
+      `DELETE FROM shopping_lists WHERE id = ? AND user_id = ?`,
+      [id, userId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+    }
+
+    res.status(204).send();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to delete shopping list" } });
+  }
+});
+
+
+
+
+// ----------------------------------------------
+// SHOPPING LIST ITEMS MANAGEMENT
+// ----------------------------------------------
+
+// GET /shopping-lists/:id/items
+/**
+ * @openapi
+ * /shopping-lists/{id}/items:
+ *   get:
+ *     tags: [Shopping List Items]
+ *     summary: Seznam postavk na listku (pagination)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, minimum: 1, default: 1 }
+ *       - in: query
+ *         name: pageSize
+ *         schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+ *     responses:
+ *       200:
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data: { $ref: '#/components/schemas/ShoppingListItemsPage' }
+ *       400:
+ *         description: Invalid list id
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: List not found (ne obstaja ali ni tvoj)
+ *       500:
+ *         description: Server error
+ */
+app.get("/shopping-lists/:id/items", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const listId = parseId(req.params.id);
+    if (!listId) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid list id" } });
+
+    const ok = await ensureShoppingListOwned(listId, userId);
+    if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+
+    const { page, pageSize, offset } = pickPagination(req, 1, 50, 200);
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM shopping_list_items WHERE shopping_list_id = ?`,
+      [listId]
+    );
+    const total = countRows[0]?.total ?? 0;
+
+    // join ingredients for ingredient_name
+    const [rows] = await pool.query(
+      `
+      SELECT
+        sli.id, sli.shopping_list_id, sli.ingredient_id,
+        i.name AS ingredient_name,
+        sli.custom_name, sli.quantity, sli.unit, sli.is_checked, sli.from_recipe_id,
+        sli.created_at, sli.updated_at
+      FROM shopping_list_items sli
+      LEFT JOIN ingredients i ON i.id = sli.ingredient_id
+      WHERE sli.shopping_list_id = ?
+      ORDER BY sli.is_checked ASC, sli.id ASC
+      LIMIT ? OFFSET ?
+      `,
+      [listId, pageSize, offset]
+    );
+
+    res.json({ data: { items: rows, page, pageSize, total } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to list shopping list items" } });
+  }
+});
+
+// POST /shopping-lists/:id/items
+/**
+ * @openapi
+ * /shopping-lists/{id}/items:
+ *   post:
+ *     tags: [Shopping List Items]
+ *     summary: Doda postavko na listek (ingredient ali custom)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               ingredientId: { type: integer, format: int64, nullable: true, example: 5 }
+ *               customName: { type: string, nullable: true, example: "Papirnate brisače" }
+ *               quantity: { type: number, nullable: true, example: 1 }
+ *               unit: { type: string, nullable: true, example: "kg" }
+ *               fromRecipeId: { type: integer, format: int64, nullable: true, example: 3 }
+ *           description: "Pošlji ingredientId ali customName (vsaj eno)."
+ *           examples:
+ *             ingredient:
+ *               value: { "ingredientId": 5, "quantity": 1, "unit": "kg" }
+ *             custom:
+ *               value: { "customName": "Papirnate brisače" }
+ *     responses:
+ *       201:
+ *         description: Created
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: integer, format: int64, example: 88 }
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: List not found
+ *       500:
+ *         description: Server error
+ */
+app.post("/shopping-lists/:id/items", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const listId = parseId(req.params.id);
+    if (!listId) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid list id" } });
+
+    const ok = await ensureShoppingListOwned(listId, userId);
+    if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+
+    const ingredientId = req.body?.ingredientId !== undefined ? parseId(req.body.ingredientId) : null;
+    const customName = (req.body?.customName || "").trim();
+
+    if (!ingredientId && !customName) {
+      return res.status(400).json({
+        error: { code: "VALIDATION_ERROR", message: "ingredientId or customName is required" },
+      });
+    }
+
+    const quantity = req.body?.quantity ?? null;
+    const unit = req.body?.unit !== undefined ? String(req.body.unit).trim() : null;
+    const fromRecipeId = req.body?.fromRecipeId !== undefined ? parseId(req.body.fromRecipeId) : null;
+
+    // Optional: validate ingredient exists if ingredientId is provided
+    if (ingredientId) {
+      const [ingRows] = await pool.query(`SELECT id FROM ingredients WHERE id = ?`, [ingredientId]);
+      if (!ingRows.length) {
+        return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "ingredientId not found" } });
+      }
+    }
+
+    const [result] = await pool.query(
+      `
+      INSERT INTO shopping_list_items
+        (shopping_list_id, ingredient_id, custom_name, quantity, unit, is_checked, from_recipe_id, created_at, updated_at)
+      VALUES
+        (?, ?, ?, ?, ?, 0, ?, NOW(), NOW())
+      `,
+      [
+        listId,
+        ingredientId || null,
+        ingredientId ? null : customName,
+        quantity,
+        unit,
+        fromRecipeId,
+      ]
+    );
+
+    res.status(201).json({ data: { id: result.insertId } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to create shopping list item" } });
+  }
+});
+
+
+
+// PATCH /shopping-lists/:id/items/:itemId
+/**
+ * @openapi
+ * /shopping-lists/{id}/items/{itemId}:
+ *   patch:
+ *     tags: [Shopping List Items]
+ *     summary: Posodobi postavko (check/uncheck, količina, ime...)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *       - in: path
+ *         name: itemId
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               ingredientId: { type: integer, format: int64, nullable: true }
+ *               customName: { type: string, nullable: true }
+ *               quantity: { type: number, nullable: true }
+ *               unit: { type: string, nullable: true }
+ *               isChecked: { type: integer, example: 1, description: "0/1" }
+ *               fromRecipeId: { type: integer, format: int64, nullable: true }
+ *           description: "Pošlji samo polja, ki jih spreminjaš."
+ *     responses:
+ *       200:
+ *         description: Updated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     updated: { type: boolean, example: true }
+ *       400:
+ *         description: Validation error / no fields
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: List ali item not found
+ *       500:
+ *         description: Server error
+ */
+app.patch("/shopping-lists/:id/items/:itemId", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const listId = parseId(req.params.id);
+    const itemId = parseId(req.params.itemId);
+    if (!listId || !itemId) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid id" } });
+
+    const ok = await ensureShoppingListOwned(listId, userId);
+    if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+
+    const fields = [];
+    const params = [];
+
+    // allow switch between ingredient/custom
+    if (req.body?.ingredientId !== undefined || req.body?.customName !== undefined) {
+      const ingredientId = req.body?.ingredientId !== undefined ? parseId(req.body.ingredientId) : null;
+      const customName = req.body?.customName !== undefined ? String(req.body.customName).trim() : "";
+
+      if (!ingredientId && !customName) {
+        return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "ingredientId or customName is required" } });
+      }
+
+      if (ingredientId) {
+        const [ingRows] = await pool.query(`SELECT id FROM ingredients WHERE id = ?`, [ingredientId]);
+        if (!ingRows.length) {
+          return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "ingredientId not found" } });
+        }
+        fields.push("ingredient_id = ?", "custom_name = NULL");
+        params.push(ingredientId);
+      } else {
+        fields.push("ingredient_id = NULL", "custom_name = ?");
+        params.push(customName);
+      }
+    }
+
+    if (req.body?.quantity !== undefined) {
+      fields.push("quantity = ?");
+      params.push(req.body.quantity);
+    }
+
+    if (req.body?.unit !== undefined) {
+      const unit = req.body.unit === null ? null : String(req.body.unit).trim();
+      fields.push("unit = ?");
+      params.push(unit);
+    }
+
+    if (req.body?.isChecked !== undefined) {
+      const v = req.body.isChecked ? 1 : 0;
+      fields.push("is_checked = ?");
+      params.push(v);
+    }
+
+    if (req.body?.fromRecipeId !== undefined) {
+      const fromRecipeId = req.body.fromRecipeId === null ? null : parseId(req.body.fromRecipeId);
+      fields.push("from_recipe_id = ?");
+      params.push(fromRecipeId);
+    }
+
+    if (!fields.length) {
+      return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "No fields to update" } });
+    }
+
+    fields.push("updated_at = NOW()");
+
+    const [result] = await pool.query(
+      `UPDATE shopping_list_items SET ${fields.join(", ")} WHERE id = ? AND shopping_list_id = ?`,
+      [...params, itemId, listId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: { code: "NOT_FOUND", message: "Item not found" } });
+    }
+
+    res.json({ data: { updated: true } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to update shopping list item" } });
+  }
+});
+
+// DELETE /shopping-lists/:id/items/:itemId
+/**
+ * @openapi
+ * /shopping-lists/{id}/items/{itemId}:
+ *   delete:
+ *     tags: [Shopping List Items]
+ *     summary: Izbriše postavko z listka
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *       - in: path
+ *         name: itemId
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     responses:
+ *       204:
+ *         description: Deleted
+ *       400:
+ *         description: Invalid id
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: List ali item not found
+ *       500:
+ *         description: Server error
+ */
+app.delete("/shopping-lists/:id/items/:itemId", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const listId = parseId(req.params.id);
+    const itemId = parseId(req.params.itemId);
+    if (!listId || !itemId) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid id" } });
+
+    const ok = await ensureShoppingListOwned(listId, userId);
+    if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+
+    const [result] = await pool.query(
+      `DELETE FROM shopping_list_items WHERE id = ? AND shopping_list_id = ?`,
+      [itemId, listId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: { code: "NOT_FOUND", message: "Item not found" } });
+    }
+
+    res.status(204).send();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to delete shopping list item" } });
+  }
+});
+
+// PATCH /shopping-lists/:id/items:bulk
+/**
+ * @openapi
+ * /shopping-lists/{id}/items:bulk:
+ *   patch:
+ *     tags: [Shopping List Items]
+ *     summary: Bulk update postavk (npr. odkljukaj več postavk)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [items]
+ *             properties:
+ *               items:
+ *                 type: array
+ *                 minItems: 1
+ *                 items:
+ *                   type: object
+ *                   required: [id]
+ *                   properties:
+ *                     id: { type: integer, format: int64 }
+ *                     isChecked: { type: integer, description: "0/1" }
+ *                     quantity: { type: number, nullable: true }
+ *     responses:
+ *       200:
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     updatedCount: { type: integer, example: 3 }
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: List not found
+ *       500:
+ *         description: Server error
+ */
+app.patch("/shopping-lists/:id/items:bulk", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const listId = parseId(req.params.id);
+    if (!listId) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid list id" } });
+
+    const ok = await ensureShoppingListOwned(listId, userId);
+    if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+
+    const items = req.body?.items;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "items[] is required" } });
+    }
+
+    let updatedCount = 0;
+
+    // simple sequential updates (good enough for now)
+    for (const it of items) {
+      const itemId = parseId(it?.id);
+      if (!itemId) continue;
+
+      const fields = [];
+      const params = [];
+
+      if (it.isChecked !== undefined) {
+        fields.push("is_checked = ?");
+        params.push(it.isChecked ? 1 : 0);
+      }
+      if (it.quantity !== undefined) {
+        fields.push("quantity = ?");
+        params.push(it.quantity);
+      }
+      if (!fields.length) continue;
+
+      fields.push("updated_at = NOW()");
+
+      const [r] = await pool.query(
+        `UPDATE shopping_list_items SET ${fields.join(", ")} WHERE id = ? AND shopping_list_id = ?`,
+        [...params, itemId, listId]
+      );
+      if (r.affectedRows > 0) updatedCount += r.affectedRows;
+    }
+
+    res.json({ data: { updatedCount } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to bulk update items" } });
+  }
+});
+
+
+// POST /shopping-lists/:id/items:clearChecked
+/**
+ * @openapi
+ * /shopping-lists/{id}/items:clearChecked:
+ *   post:
+ *     tags: [Shopping List Items]
+ *     summary: Pobriše vse checked postavke na listku
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer, format: int64 }
+ *     responses:
+ *       200:
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     deletedCount: { type: integer, example: 5 }
+ *       400:
+ *         description: Invalid list id
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: List not found
+ *       500:
+ *         description: Server error
+ */
+app.post("/shopping-lists/:id/items:clearChecked", authRequired, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const listId = parseId(req.params.id);
+    if (!listId) return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Invalid list id" } });
+
+    const ok = await ensureShoppingListOwned(listId, userId);
+    if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
+
+    const [result] = await db.query(
+      `DELETE FROM shopping_list_items WHERE shopping_list_id = ? AND is_checked = 1`,
+      [listId]
+    );
+
+    res.json({ data: { deletedCount: result.affectedRows || 0 } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Failed to clear checked items" } });
+  }
+});
 
 
 // START SERVER
