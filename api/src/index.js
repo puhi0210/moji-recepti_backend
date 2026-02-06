@@ -6,8 +6,25 @@ const swaggerUi = require("swagger-ui-express");
 const swaggerJSDoc = require("swagger-jsdoc");
 require("dotenv").config();
 
+
+const cors = require("cors");
+
 const app = express();
+
+// CORS
+app.use(cors({
+  origin: [
+    "http://localhost:5173", // Vite
+    "http://localhost:3000",
+    "http://localhost:4200", // Angular (rezerva)
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+
 app.use(express.json());
+
 
 
 // Swagger setup
