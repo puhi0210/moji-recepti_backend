@@ -16,6 +16,7 @@ app.use(cors({
   origin: [
     "http://localhost:5173", // Vite
     "http://localhost:3000",
+    "http://localhost:8081",
     "http://localhost:4200", // Angular (rezerva)
   ],
   credentials: true,
