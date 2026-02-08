@@ -329,7 +329,7 @@ async function ensureShoppingListOwned(listId, userId) {
 app.get("/health", async (req, res) => {
   try {
     const [rows] = await pool.query("SELECT 1 AS ok");
-    res.status(200).json({ status: "ok", db: rows[0] });
+    res.status(200).json({ status: "ok", pool: rows[0] });
   } catch (err) {
     res.status(500).json({ status: "error", message: err.message });
   }
@@ -3296,7 +3296,7 @@ app.post("/shopping-lists/:id/items:clearChecked", authRequired, async (req, res
     const ok = await ensureShoppingListOwned(listId, userId);
     if (!ok) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Shopping list not found" } });
 
-    const [result] = await db.query(
+    const [result] = await pool.query(
       `DELETE FROM shopping_list_items WHERE shopping_list_id = ? AND is_checked = 1`,
       [listId]
     );
