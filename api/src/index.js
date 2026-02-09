@@ -1833,9 +1833,15 @@ app.get("/inventory/items", authRequired, async (req, res) => {
     }
 
     if (search) {
-      where += " AND (COALESCE(i.name, ii.custom_name) LIKE ?)";
-      params.push(`%${search}%`);
+      where +=
+        " AND (" +
+        "   (i.name IS NOT NULL AND (i.name COLLATE utf8mb4_unicode_ci) LIKE (? COLLATE utf8mb4_unicode_ci))" +
+        "   OR " +
+        "   (i.name IS NULL AND (ii.custom_name COLLATE utf8mb4_unicode_ci) LIKE (? COLLATE utf8mb4_unicode_ci))" +
+        " )";
+      params.push(`%${search}%`, `%${search}%`);
     }
+
 
     const [countRows] = await pool.query(
       `SELECT COUNT(*) AS total
@@ -1863,9 +1869,12 @@ app.get("/inventory/items", authRequired, async (req, res) => {
        LEFT JOIN ingredients i ON i.id = ii.ingredient_id
        ${where}
        ORDER BY
-         (ii.expires_at IS NULL) ASC,
-         ii.expires_at ASC,
-         COALESCE(i.name, ii.custom_name) ASC
+        (ii.expires_at IS NULL) ASC,
+        ii.expires_at ASC,
+        (CASE
+          WHEN i.name IS NOT NULL THEN i.name
+          ELSE ii.custom_name
+        END) COLLATE utf8mb4_unicode_ci ASC
        LIMIT ? OFFSET ?`,
       [...params, pageSize, offset]
     );
